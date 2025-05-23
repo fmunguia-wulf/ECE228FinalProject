@@ -4,6 +4,7 @@ __pycache__/
 
 figs/
 utils/__pycache__/
+models/__pycache__/
 config/__pycache__/
 config/.ipynb_checkpoints/
 utils/.ipynb_checkpoints/

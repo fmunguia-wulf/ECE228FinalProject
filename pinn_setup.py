@@ -34,7 +34,9 @@ class PINN(nn.Module):
             self.net_phi = self.build_network(layers)
             self.net_v3 = self.build_network(layers)
             self.net_v4 = self.build_network(layers)
-            self.loss_history = {'ne': [], 'Te': [], 'f1': [], 'f5': []}
+            self.loss_history = {
+                'ne': [], 'Te': [], 'ne_pde': [], 'Te_pde': []
+            }
         else:
             self.loss_history = {'ne': [], 'Te': []}
 
@@ -82,10 +84,26 @@ class PINN(nn.Module):
         """Compute plasma variables and PDE terms."""
         # Concatenate inputs
         X = torch.cat([x, y, t], dim=1)
-        
-        # Core outputs
-        ne = self.forward(X, self.net_ne)
-        Te = self.forward(X, self.net_Te)
+
+        # NNs predict log values from (already normalized) inputs,
+        # preserving positivity in predictions
+        log_ne = self.forward(X, self.net_ne)
+        log_Te = self.forward(X, self.net_Te)
+        ne = torch.exp(log_ne)
+        Te = torch.exp(log_Te)
+
+        # Original
+        # # Core outputs
+        # ne = self.forward(X, self.net_ne)
+        # Te = self.forward(X, self.net_Te)
+
+        # SCRATCH
+        # # NNs predict normalized values from (already normalized) inputs
+        # ne_norm = self.forward(X, self.net_ne)
+        # Te_norm = self.forward(X, self.net_Te)
+        # # Unnormalize predictions for output and use in PDE losses
+        # ne = ne_norm * (4e19 - 4e18) + 4e18
+        # Te = Te_norm * (80 - 8) + 8
         
         if not self.use_pde:
             return ne, Te, None, None, None, None, None
@@ -129,12 +147,12 @@ class PINN(nn.Module):
         )[0]
         jp = ne * ((TAU_T ** 0.5) * v4 - v3)
         
-        # Log-transformed variables
-        lnn = torch.log(ne)
-        lnTe = torch.log(Te)
+        # # Log-transformed variables
+        # log_ne = torch.log(ne)
+        # log_Te = torch.log(Te)
         
         # Higher-order derivatives
-        D_lnn, D_lnTe = self.compute_high_order_derivs(lnn, lnTe, x, y)
+        D_log_ne, D_log_Te = self.compute_high_order_derivs(log_ne, log_Te, x, y)
         
         # Source terms
         S_n, S_Ee = self.compute_source_terms(x, ne, Te)
@@ -143,12 +161,12 @@ class PINN(nn.Module):
         f_ne, f_Te = self.compute_residuals(
             ne, Te, ne_t, ne_x, ne_y, phi_x, phi_y,
             Te_t, Te_x, Te_y, B, pe_y, jp, pe,
-            D_lnn, D_lnTe, S_n, S_Ee
+            D_log_ne, D_log_Te, S_n, S_Ee
         )
         
         return ne, Te, phi, v3, v4, f_ne, f_Te
         
-    def compute_high_order_derivs(self, lnn, lnTe, x, y):
+    def compute_high_order_derivs(self, log_ne, log_Te, x, y):
         """Compute derivatives up to 4th order for diffusion."""
     
         def nth_derivative(f, var, n):
@@ -163,21 +181,21 @@ class PINN(nn.Module):
             return f
     
         # Compute 4th derivatives
-        lnn_xxxx = nth_derivative(lnn, x, 4)
-        lnn_yyyy = nth_derivative(lnn, y, 4)
-        lnTe_xxxx = nth_derivative(lnTe, x, 4)
-        lnTe_yyyy = nth_derivative(lnTe, y, 4)
+        log_ne_xxxx = nth_derivative(log_ne, x, 4)
+        log_ne_yyyy = nth_derivative(log_ne, y, 4)
+        log_Te_xxxx = nth_derivative(log_Te, x, 4)
+        log_Te_yyyy = nth_derivative(log_Te, y, 4)
     
         # Diffusion terms (with normalization)
-        Dx_lnn = -((50. / self.diff_norms['DiffX_norm']) ** 2) * lnn_xxxx
-        Dy_lnn = -((50. / self.diff_norms['DiffY_norm']) ** 2) * lnn_yyyy
-        D_lnn = Dx_lnn + Dy_lnn
+        Dx_log_ne = -((50. / self.diff_norms['DiffX_norm']) ** 2) * log_ne_xxxx
+        Dy_log_ne = -((50. / self.diff_norms['DiffY_norm']) ** 2) * log_ne_yyyy
+        D_log_ne = Dx_log_ne + Dy_log_ne
     
-        Dx_lnTe = -((50. / self.diff_norms['DiffX_norm']) ** 2) * lnTe_xxxx
-        Dy_lnTe = -((50. / self.diff_norms['DiffY_norm']) ** 2) * lnTe_yyyy
-        D_lnTe = Dx_lnTe + Dy_lnTe
+        Dx_log_Te = -((50. / self.diff_norms['DiffX_norm']) ** 2) * log_Te_xxxx
+        Dy_log_Te = -((50. / self.diff_norms['DiffY_norm']) ** 2) * log_Te_yyyy
+        D_log_Te = Dx_log_Te + Dy_log_Te
     
-        return D_lnn, D_lnTe
+        return D_log_ne, D_log_Te
     
     def compute_source_terms(self, x, ne, Te):
         """Compute source terms with conditions."""
@@ -213,11 +231,11 @@ class PINN(nn.Module):
         return S_n, S_Ee
     
     def compute_residuals(self, ne, Te, ne_t, ne_x, ne_y, phi_x, phi_y,
-                          Te_t, Te_x, Te_y, B, pe_y, jp, pe, D_lnn, D_lnTe,
+                          Te_t, Te_x, Te_y, B, pe_y, jp, pe, D_log_ne, D_log_Te,
                           S_n, S_Ee):
         """Compute PDE residuals."""
         f_ne = ne_t + (1. / B) * (phi_y * ne_x - phi_x * ne_y) - (
-            -EPS_R * (ne * phi_y - ALPHA_D * pe_y) + S_n + ne * D_lnn
+            -EPS_R * (ne * phi_y - ALPHA_D * pe_y) + S_n + ne * D_log_ne
         )
     
         f_Te = Te_t + (1. / B) * (phi_y * Te_x - phi_x * Te_y) - Te * (
@@ -228,7 +246,7 @@ class PINN(nn.Module):
                     0.71 * EPS_V * 0.0 +  # May replace `0.0` with a term later
                     ETA * jp * jp / (Te * MASS_RATIO)
                 )
-            ) + (2. / (3. * pe)) * S_Ee + D_lnTe
+            ) + (2. / (3. * pe)) * S_Ee + D_log_Te
         )
     
         return f_ne, f_Te
@@ -256,14 +274,28 @@ class PINN(nn.Module):
         ne_pred, Te_pred, _, _, _, f_ne, f_Te = self.net_plasma(
             x_b, y_b, t_b
         )
-    
-        loss_ne = loss_fn(ne_pred, ne_target)
-        loss_Te = loss_fn(Te_pred, Te_target)
+
+        # Evaluate data-fit losses on log values
+        loss_ne = loss_fn(torch.log(ne_pred), torch.log(ne_target))
+        loss_Te = loss_fn(torch.log(Te_pred), torch.log(Te_target))
+
+        # SCRATCH
+        # # Evaluate data-fit losses on normalized values
+        # ne_pred_norm = (ne_pred - 4e18) / (4e19 - 4e18)
+        # ne_target_norm = (ne_target - 4e18) / (4e19 - 4e18)
+        # Te_pred_norm = (Te_pred - 8) / (80 - 8)
+        # Te_target_norm = (Te_target - 8) / (80 - 8)
+        # loss_ne = loss_fn(ne_pred_norm, ne_target_norm)
+        # loss_Te = loss_fn(Te_pred_norm, Te_target_norm)
+
+        # Original
+        # loss_ne = loss_fn(ne_pred, ne_target)
+        # loss_Te = loss_fn(Te_pred, Te_target)
     
         if self.use_pde:
-            loss_f1 = loss_fn(f_ne, torch.zeros_like(f_ne))
-            loss_f5 = loss_fn(f_Te, torch.zeros_like(f_Te))
-            total_loss = loss_ne + loss_Te + loss_f1 + loss_f5
+            ne_pde_loss = loss_fn(f_ne, torch.zeros_like(f_ne))
+            Te_pde_loss = loss_fn(f_Te, torch.zeros_like(f_Te))
+            total_loss = loss_ne + loss_Te + ne_pde_loss + Te_pde_loss
         else:
             total_loss = loss_ne + loss_Te
     
@@ -279,11 +311,11 @@ class PINN(nn.Module):
         self.loss_history['Te'].append(loss_Te.item())
     
         if self.use_pde:
-            self.loss_history['f1'].append(loss_f1.item())
-            self.loss_history['f5'].append(loss_f5.item())
+            self.loss_history['ne_pde'].append(ne_pde_loss.item())
+            self.loss_history['Te_pde'].append(Te_pde_loss.item())
             return {
                 'ne': loss_ne.item(), 'Te': loss_Te.item(),
-                'f1': loss_f1.item(), 'f5': loss_f5.item(),
+                'ne_pde': ne_pde_loss.item(), 'Te_pde': Te_pde_loss.item(),
                 'total': total_loss.item()
             }
         else:
@@ -323,9 +355,28 @@ class PINN(nn.Module):
         y = torch.tensor(y_star, dtype=torch.float32).to(self.device)
         t = torch.tensor(t_star, dtype=torch.float32).to(self.device)
     
-        ne, Te, phi, v3, v4, _, _ = self.net_plasma(
-            x.requires_grad_(), y.requires_grad_(), t.requires_grad_()
-        )
+        # Predict: Below is copied from net_plasma to avoid computing gradients
+        # and clashing with no_grad decorator
+        # Concatenate inputs
+        X = torch.cat([x, y, t], dim=1)
+
+        # NNs predict log values from (already normalized) inputs,
+        # preserving positivity in predictions
+        log_ne = self.forward(X, self.net_ne)
+        log_Te = self.forward(X, self.net_Te)
+        ne = torch.exp(log_ne)
+        Te = torch.exp(log_Te)
+
+        # Original
+        # ne, Te, phi, v3, v4, _, _ = self.net_plasma(
+        #     x.requires_grad_(), y.requires_grad_(), t.requires_grad_()
+        # )
+
+        if self.use_pde:
+            phi = self.forward(X, self.net_phi)
+            v3 = self.forward(X, self.net_v3)
+            v4 = self.forward(X, self.net_v4)
+        # ----------
     
         result = {'ne': ne.cpu().numpy(), 'Te': Te.cpu().numpy()}
         if self.use_pde:
